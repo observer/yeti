@@ -1,0 +1,577 @@
+#+title: Yeti - Yeti eagerly templates incus
+
+~yeti~ is a lightweight tool for declaratively managing [[https://linuxcontainers.org/incus/][incus]] containers and virtual machines. Describe the instances you want declaratively and ~yeti~ will make sure they exist.
+
+The primary motivation for creating ~yeti~ was to have a convenient way to manage ~incus~ instances in NixOS, however ~yeti~ comes in two pieces:
+
+- A *NixOS module* that allows defining ~incus~ instances as part of a declarative NixOS system configuration.
+
+- A *standalone CLI* (~yeti~), that will create instances according to a ~spec.yaml~ and applies them.
+
+Both of them allow for easy and convenient management of a lot of instances with the standalone tool also offering support for managing remote incus installations via their API as well as non-privileged user access to incus (with the user being part of the ~incus~ and not the ~incus-admin~ group).
+
+The NixOS module on the other hand is designed to be run as part of ~nixos-rebuild~, with a ~one-shot~ systemd service firing during the activation phase, making sure all defined instances exist and failing with meaningful error handling for those instances, where the server side state doesn't match the configuration.
+
+Here is a minimal example for a NixOS configuration, which will create and launch some instances across 2 incus projects (~default~ and ~dev~):
+
+#+begin_src nix
+...
+yeti = {
+  default = { # <- incus default project 
+    test-container = {
+      image.alias  = "debian/12";
+      image.server = "https://images.linuxcontainers.org";
+    };
+    test-vm = {
+      type         = "virtual-machine";
+      image.alias  = "debian/12";
+      image.server = "https://images.linuxcontainers.org";
+    };
+  };
+  dev = { # <- incus dev project
+    test-oci-container = {
+      image.alias  = "nginx";
+      image.server = "https://docker.io";
+      image.protocol = "oci";
+    };     
+  };  
+};
+...
+#+end_src
+
+The same configuration as ~spec.yaml~ for use with the standalone ~yeti~ cli tool:
+
+#+begin_src yaml
+resources:
+- autostart: true
+  image:
+    alias: debian/12
+    server: https://images.linuxcontainers.org
+  kind: instance
+  name: test-container
+  project: default
+  type: container
+- autostart: true
+  image:
+    alias: debian/12
+    server: https://images.linuxcontainers.org
+  kind: instance
+  name: test-vm
+  project: default
+  type: virtual-machine
+- autostart: true
+  image:
+    alias: nginx
+    protocol: oci
+    server: https://docker.io
+  kind: instance
+  name: test-oci-container
+  project: dev
+  type: container
+#+end_src
+
+* Motivation
+
+While it is definitely already possible to manage containers and virtual machines declaratively in NixOS using other means, ~incus~ actually provides its users a lot of convenience, all bundled within one CLI / API. And while ~yeti~ is intended to bridge the gap between having to manage ~incus~ completely by hand on a NixOS host and managing instances declaratively, it is not disabling its users from using ~incus~ in a non-declarative way. It is still entirely possible to manage all of the ~incus~ instances manually.
+
+So if you are e.g. maintaining a service such as Nextcloud for a couple of users and then suddenly the update to the next NixOS version comes around, you can conveniently use ~incus~ to take a snapshot of it, then attempt an upgrade and - just in case anything should go wrong - immediately grant your users access to the old snapshot again, while you figure out the issue with the update on a clone of the service without disrupting access to it. Once you have figured out the correct upgrade path, you can simply try again or - in case of a less stateful service - switch your service to the newly upgraded one by integrating it into the ~yeti~ spec and dropping the old one.
+
+* Scope
+
+The scope of ~yeti~ is intentionally kept minimal, it is intended to bridge a gap, not to take over any of the functionality already provided otherwise.
+
+The following is in scope:
+- Creating incus instances (containers, virtual machines and oci containers)
+- Verifying that an existing instance is matching, what has been defined inside of the NixOS configuration or ~spec.yaml~
+- Failing on mismatch with clear and concise next steps on how to proceed to resolve the issue
+- Keeping track of instances created with yeti on the server side in order be able to reconcile the state between server and configuration / ~spec.yaml~
+
+Now here is what is outside scope:
+- Managing incus projects, profiles, networks, storage pools - set those up via [[https://linuxcontainers.org/incus/docs/main/howto/initialize/#non-interactive-configuration][incus preseed]], ~virtualisation.incus.preseed~ on NixOS or any way that feels right; ~yeti~ verifies the needed resources exist before depending on them
+- Modifying running instances in place (mismatches always require manual action; this protects against silently destructive reconfigures)
+- Instance lifecycle beyond creation - instances are created or launched, once they exist, other means of managing them should take over
+- Snapshots, backups, migration
+
+* Installation
+
+** As a NixOS flake input
+
+~yeti~ exposes a NixOS module via its flake. Add it to your system flake:
+
+#+begin_src nix
+{
+  inputs = {
+    nixpkgs.url  = "github:NixOS/nixpkgs/nixos-unstable";
+    yeti.url  = "github:observer/yeti";
+  };
+
+  outputs = { nixpkgs, yeti, ... }: {
+    nixosConfigurations.hostname = nixpkgs.lib.nixosSystem {
+      system  = "x86_64-linux";
+      modules = [
+        yeti.nixosModules.yeti
+        ./configuration.nix
+      ];
+    };
+  };
+}
+#+end_src
+
+Both ~nixosModules.default~ and ~nixosModules.yeti~ point at the same module — use whichever reads better in your imports.
+
+** Prerequisites
+
+~yeti~ is using a ~incus-yeti~ System User, which runs as a member of the ~incus-admin~ group. That group is created by the incus systemd service. Using ~yeti~ therefore requires ~incus~ to already be set up on the host system:
+
+#+begin_src nix
+{
+  virtualisation.incus.enable = true;
+}
+#+end_src
+
+The module asserts this at evaluation time, so defining resources without it produces a clear ~nixos-rebuild~ error.
+
+~projects~, ~profiles~, ~networks~, and ~storage pools~ referenced by your configuration must already exist on the ~incus~ side. Set those up with ~virtualisation.incus.preseed~, [[https://linuxcontainers.org/incus/docs/main/howto/initialize/#non-interactive-configuration][incus preseed]] or however you prefer; the reconciler verifies they're present before depending on them.
+
+** Standalone ~yeti~ CLI
+
+The same flake exposes ~incus-reconcile~ as a regular package. Run it directly:
+
+#+begin_src sh
+nix run github:observer/yeti -- spec.yaml
+#+end_src
+
+The CLI needs access to an incus socket — by default the local admin socket. See [[#transport-flags][Transport flags]] below for connecting to other sockets or remote incus servers.
+
+* Using the NixOS module
+
+** A minimal instance
+
+#+begin_src nix
+{
+  virtualisation.incus.enable = true;
+
+  yeti.default.web = {
+    image.alias  = "debian/12";
+    image.server = "https://images.linuxcontainers.org";
+  };
+}
+#+end_src
+
+On the next ~nixos-rebuild~, an incus container named ~web~ in project ~default~ is created and started. Subsequent rebuilds reconcile it against the spec but otherwise leave it alone.
+
+** Layout: project, then instance
+
+The option path is ~yeti.<project>.<instance>~. The outer attribute is the incus project; the inner is the instance name (which defaults to the attribute key, but can be overridden with an explicit ~name~). This nesting means the same instance name can appear in different projects without colliding:
+
+#+begin_src nix
+{
+  yeti = {
+    default.web = { image.alias = "debian/12"; ... };
+    dev.web     = { image.alias = "debian/12"; ... };  # different project
+  };
+}
+#+end_src
+
+** When the reconciler runs
+
+The module generates a YAML spec from your options and runs ~yeti~ as a oneshot systemd service (~incus-yeti.service~):
+
+- It runs after ~incus.service~ on boot.
+- It re-runs whenever the generated spec changes — i.e. whenever you edit a ~yeti.*~ option and rebuild.
+- It runs as a dedicated ~incus-yeti~ user, added to the ~incus-admin~ group.
+
+A normal ~nixos-rebuild switch~ invokes the unit during activation; per-resource ~ok~ / ~created~ / ~FAIL~ lines appear in the build output. To trigger a reconcile without rebuilding, ~systemctl start incus-yeti~.
+
+In case the error messages are too long to be displayed, e.g. when using tools like ~colmena~ to deploy, ~journalctl -xeu incus-yeti.service~ will provide the full output.
+
+* Option reference
+
+Sidenote: Any option later on referred to as ~nullable string~ in the following, will have a default value of ~null~ and in the process of the ~yeti~ NixOS module creating the ~spec.yaml~ be dropped, so the yaml is minimal and only contains values that are necessary.
+
+** Module-level: ~yetiDefaults~
+
+~yetiDefaults~ is a submodule parallel to the ~yeti~ submodule, which is intended for storing the default behavior of certain options. Currently this submodule only contains one option. By splitting these submodules up, the ~yeti~ submodule always points to ~yeti.<project>.<instance-name>.*~, while default behavior is maintained inside of ~yetiDefaults~ instead.
+
+- ~yetiDefaults.autostart~ :: bool, default ~true~. Default value of each instance's ~autostart~ field. Flip to ~false~ to make new instances default to "create stopped" rather than "create and launch".
+
+** Per-instance: ~yeti.<project>.<instance>~
+
+*** Identity
+
+- ~name~ :: string, default = attribute key. The incus instance name. Override when your attribute key is a friendly handle and the actual instance name should differ.
+- ~type~ :: enum ~"container" | "virtual-machine"~, default ~"container"~. The incus instance type.
+- ~description~ :: nullable string, default ~null~. The incus instance description. An empty string is forwarded; ~null~ omits the field.
+
+*** Image source
+
+The ~yeti.<project>.<instance-name>.image~ submodule describes where the instance's image comes from. See [[#image-source-variants][Image source variants]] for the supported combinations.
+
+- ~image.fingerprint~ :: nullable string, default ~null~. Exact image fingerprint. Pinning to a fingerprint guarantees bit-identical images across hosts.
+- ~image.alias~ :: nullable string, default ~null~. Human-readable name like ~"debian/12"~ or ~"nginx"~.
+- ~image.server~ :: nullable string, default ~null~. Remote server URL when the image must be fetched.
+- ~image.protocol~ :: nullable string, default ~null~. One of ~"simplestreams"~, ~"oci"~, or ~"incus"~. Defaults to ~"simplestreams"~ when fetching. Unknown values fail at evaluation time.
+
+*** Profiles, config, devices
+
+- ~profiles~ :: nullable list of strings, default ~null~ (incus applies its server-side default). Each profile listed must already exist in the target project.
+- ~config~ :: nullable attribute set of strings, default ~null~. User-settable incus config keys (~limits.cpu~, ~boot.autostart~, ~user.*~, ...). Values compared as strings.
+- ~devices~ :: nullable attribute set, default ~null~. Each entry has a required ~type~ field plus arbitrary string-valued keys. NIC entries referencing a managed ~network~ and disk entries referencing a ~pool~ are checked against the incus side before creation.
+
+*** Lifecycle
+
+- ~autostart~ :: bool, default from ~yetiDefaults.autostart~. Whether to start the instance immediately after creation. Affects creation only — does not stop or start existing instances on subsequent reconciles.
+- ~forceEphemeral~ :: bool, default ~false~. Set to ~true~ to mark an instance as ephemeral. Named separately from incus's own ~ephemeral~ on purpose: ephemeral instances disappear when they stop, and naïvely re-creating them on every rebuild is usually a footgun. Setting plain ~ephemeral = true~ fails with an assertion that points at this option.
+
+Sidenote: The ~yeti.autostart~ option as well as its conterpart inside of ~yetiDefaults~ only distinguishes the first-time launch behavior of the instance. With ~autostart~ set to ~true~, the instance is immediately started similiar to what happens when ~incus launch~ is used to create an instance, with the value set to ~false~, the instance is created, but not started, similiart to what happens using the ~incus create~ command. However this does not make the instance autostart after reboots or ~incus~ daemon restarts, for that ~incus~ already provides a built-in config option ~config.boot.autostart~, which should be used to configure that behavior.
+
+*** Image source variants
+
+Instance images can be declared using various combinations of keys, here is the default behavior for the combinations available:
+
+| Spec keys                      | Source                       | Notes                                                   |
+|--------------------------------+------------------------------+---------------------------------------------------------|
+| ~fingerprint~                  | Local cache only             | Fails if not cached                                     |
+| ~fingerprint + server~         | Local first, remote on miss  | Remote fallback not available for ~protocol = "oci"~    |
+| ~alias~                        | Local alias                  | Alias must exist in target project                      |
+| ~alias + server~               | Remote pull by alias         | The most common shape                                   |
+| ~fingerprint + alias + server~ | Fingerprint takes precedence | Alias still recorded in metadata for future equivalence |
+
+OCI registries can be queried only by alias/tag, not by raw fingerprint. So an OCI spec is fingerprint-compatible only /once the image is locally cached/, however it cannot fetch an image by fingerprint from the registry directly. Use aliases for the initial pull, then in case the image should be pinned use the images fingerpring, which is locally cached by ~incus~.
+
+* Using the standalone CLI
+
+The NixOS module generates a ~spec.yaml~ automatically; for standalone use, you write the same YAML yourself. The reconciler is the same in both cases.
+
+** Invocation
+
+#+begin_src sh
+yeti spec.yaml                           # local admin socket (default)
+yeti --user spec.yaml                    # local user socket
+yeti --socket /run/foo/sock spec.yaml    # custom socket path
+yeti --remote prod spec.yaml             # configured incus remote
+#+end_src
+
+Exit codes: ~0~ on full success, ~1~ on any per-resource failure (other resources are still attempted), ~2~ on argument errors (default ~argparse~ behavior).
+
+** Transport flags
+
+| Flag            | Behavior                                                      |
+|-----------------+---------------------------------------------------------------|
+| ~--user~        | Use ~/var/lib/incus/unix.socket.user~ (group ~incus~ access)  |
+| ~--socket PATH~ | Use an arbitrary local socket                                 |
+| ~--remote NAME~ | Use a configured incus remote by name; drops ~--force-local~  |
+
+** Spec format
+
+A single ~resources~ list:
+
+#+begin_src yaml
+resources:
+  - kind: instance
+    name: web-1
+    project: default              # required for standalone (the module injects it)
+    type: container               # optional, defaults to container
+    autostart: true               # optional, defaults to true
+
+    image:
+      alias: debian/12
+      server: https://images.linuxcontainers.org
+      protocol: simplestreams     # optional
+
+    profiles: [default]
+    config:
+      limits.cpu: "2"
+      boot.autostart: "true"
+    devices:
+      eth0:
+        type: nic
+        network: incusbr0
+#+end_src
+
+The fields match the NixOS options one-to-one. Required per resource: ~kind: instance~, ~name~, and an ~image~ section with either ~fingerprint~ or ~alias~. Defaults match the module.
+
+* Common patterns
+
+** A virtual machine
+
+#+begin_src nix
+yeti.default.builder = {
+  type = "virtual-machine";
+  image = {
+    alias  = "debian/12";
+    server = "https://images.linuxcontainers.org";
+  };
+  profiles = [ "default" ];
+  config = {
+    "limits.cpu"    = "4";
+    "limits.memory" = "8GB";
+  };
+};
+#+end_src
+
+The same image alias works for containers and VMs; incus picks the right artifact based on ~type~.
+
+** An OCI container (Docker Hub, GHCR, Minimus, ...)
+
+#+begin_src nix
+yeti.default.nginx = {
+  image = {
+    alias    = "nginx";
+    server   = "reg.mini.dev";
+    protocol = "oci";
+  };
+};
+#+end_src
+
+OCI containers can only be pulled by alias/tag, not by fingerprint. Once the image is cached, subsequent specs referencing that fingerprint work just like any locally cached image.
+
+** Pinning to an exact image
+
+For reproducibility across hosts, pin to a fingerprint and include the server so first-time pulls work:
+
+#+begin_src nix
+yeti.default.web = {
+  image = {
+    fingerprint = "9260d88eda062b5a3be901dfc7595f0e05a9851bc0ad83c50b874e979aab00f6";
+    server      = "https://images.linuxcontainers.org";
+  };
+};
+#+end_src
+
+~yeti~ checks the local cache first and only fetches when the fingerprint isn't there yet - so hosts that share an image cache pay the download cost just once.
+
+** Multiple instances from one image
+
+Declare them. The image is downloaded once and re-used:
+
+#+begin_src nix
+let
+  debian = {
+    image.alias  = "debian/12";
+    image.server = "https://images.linuxcontainers.org";
+  };
+in
+{
+  yeti.debianproject = {
+    container-1 = debian;
+    container-2 = debian;
+    container-3 = debian;
+  };
+}
+#+end_src
+
+** Create instances stopped instead of started
+
+To skip the launch step (incus ~create~ semantics, not ~launch~):
+
+#+begin_src nix
+yeti.default.stoppedcontainer = {
+  image.alias  = "debian/12";
+  image.server = "https://images.linuxcontainers.org";
+  autostart    = false;
+};
+#+end_src
+
+To flip the default for the whole module:
+
+#+begin_src nix
+{
+  yetiDefaults.autostart = false;
+  yeti.default.stoppedcontainer   = {
+    image.alias  = "debian/12";
+    image.server = "https://images.linuxcontainers.org";
+  };
+}
+#+end_src
+
+* When things go wrong..
+
+~yeti~ fails loudly with actionable messages. The ones you're most likely to see:
+
+** "instance is not managed by yeti"
+
+You declared a resource whose name matches an existing incus instance that wasn't created by yeti. The message lists ~incus config set~ commands to adopt the instance (by stamping the metadata keys onto it), plus the alternative of deleting it and letting ~yeti~ re-create on the next run.
+
+** "spec wants X, instance has Y"
+
+A spec field changed in a way the reconciler can't apply in place - most commonly a different ~image.alias~, ~image.fingerprint~, or ~type~. The fix is to either update the spec to match (if the change was unintended) or to delete and re-create (if it was intended).
+
+** "image fingerprint not found locally"
+
+Your spec referenced a fingerprint that isn't in the local image cache, and no ~server~ was specified to fetch it. Either add a server, or pre-pull the image with ~incus image copy <remote>:<alias> local:~.
+
+** "project ... does not exist"
+
+You declared an instance in a project that hasn't been set up on the incus side. Out of scope for the reconciler — use ~virtualisation.incus.preseed~, [[https://linuxcontainers.org/incus/docs/main/howto/initialize/#non-interactive-configuration][incus preseed]] or ~incus project create~.
+
+** Output formatting
+
+Each resource appears on its own line, with the status on the left:
+
+#+begin_example
+ok      default/web-1
+created default/web-2
+FAIL    dev/builder
+        - image alias: spec wants 'debian/13', but this instance was created from an image with aliases 'debian/12'. Either update the spec to use one of those aliases, or re-create the instance.
+#+end_example
+
+A failure produces one ~FAIL~ line plus one indented bullet per problem detected on that resource. Multiple problems on the same resource appear under one header. Successful resources still print so you can confirm the reconciler ran them.
+
+For the architecture of the reconciler itself — what it does on each run, how metadata is structured, how the NixOS module wires it together — see the next section.
+
+* Architecture at a glance
+
+~yeti~ consists of two pieces:
+
+#+begin_example
+  ┌────────────────────────────┐
+  │     NixOS module (Nix)     │
+  │  ──────────────────────    │ 
+  │  • option schema           │ 
+  │  • serializeResource       │ 
+  │  • assertions              │ 
+  │  • systemd unit            │ 
+  └──────────────┬─────────────┘
+                 │
+                 │ ExecStart
+                 │
+                 ▼               
+  ┌────────────────────────────┐ 
+  │       yeti (Python)        │ 
+  │  ──────────────────────    │
+  │  • load_spec               │
+  │  • reconcile_instance      │
+  │  • diff_instance           │
+  │  • iq() → incus query      │         
+  └──────────────┬─────────────┘
+                 │  
+                 │ POST / PATCH / GET
+                 │
+                 ▼
+          ┌─────────────┐
+          │  incus API  │
+          └─────────────┘
+#+end_example                        
+
+The NixOS module is a thin layer: it gathers user options (~yeti.<project>.<instance-name>.*~), validates them, generates a YAML file inside the nix store (using ~pkgs.formats.yaml~), and finally arranges for ~yeti~ to run with that file. ~yeti~ is where the real work happens: comparing the spec against incus state, creating instances, reporting clear failures.
+
+* What happens during a ~nixos-rebuild~
+
+The sequence end-to-end:
+
+1. *Nix evaluation:* The module's option types resolve all defaults (~name~ from attr key, ~autostart~ from ~yetiDefaults~, etc.), then ~serializeResource~ produces a list of resource dicts. Null fields are stripped, the project is injected from the outer attrset key, and ~kind: instance~ is added.
+
+2. *YAML creation:* ~pkgs.formats.yaml~ writes the list to a file in the nix store. The file path is included in the systemd unit's ~ExecStart~ and in ~restartTriggers~, so the unit re-runs whenever the spec changes.
+
+3. *System activation:* ~nixos-rebuild~ activates the new configuration. If the spec file's store path changed (meaning any ~yeti.*~ option changed), systemd restarts ~incus-yeti.service~.
+
+4. *yeti runs:* ~yeti~ loads the YAML, iterates the resources, and dispatches each to its handler via ~HANDLERS[kind]~. Currently only ~kind: instance~ is supported, mapping to ~reconcile_instance~.
+
+5. *Per resource reconciliation:* For each instance, ~reconcile_instance~ checks whether it exists. If not: validate dependencies, resolve the image, POST the create, PATCH metadata. If yes: run ~diff_instance~ to compare the spec against the running instance and either return ~"ok"~ or raise ~ResourceError~ with a list of problems.
+
+6. *Output:* ~_print_status~ emits one line per resource — ~ok~ / ~created~ / ~FAIL~ flush left, problem details indented under failures.
+
+Exit code is 0 if every resource returned ok or created, 1 if any failed.
+
+* Metadata scheme
+
+Usually an instance's config carries ~image.os~, ~image.release~, ~image.architecture~, ~image.variant~, etc. - but these are populated from the image record at creation time, and they vary across image sources. OCI containers (Docker Hub etc.) only carry ~image.architecture~ - no ~os~, no ~release~. For native images, ~image.serial~ changes on every upstream rebuild. There's no stable subset of these fields that uniquely identifies "this is the image my spec asked for".
+
+So yeti annotates instances with its own metadata and reads it back later, when comparing existing instances to its spec. To that end ~yeti~ adds values in ~incus~ custom ~user.*~ metadata config field, which is specifically intended for this kind of use.
+
+** The metadata keys
+
+| Key                                    | Purpose                                                                                 |
+|----------------------------------------+-----------------------------------------------------------------------------------------|
+| ~user.yeti.metadata.name~              | The instance name an instance was deployed under. Also a sentinel for "managed by yeti" |
+| ~user.yeti.metadata.instance.type~     | One of ~container~, ~virtual-machine~, ~oci~. Catches type changes.                     |
+| ~user.yeti.metadata.image.fingerprint~ | The fingerprint incus assigned to the underlying image.                                 |
+| ~user.yeti.metadata.image.aliases~     | JSON-encoded list of aliases — for matching equivalent specs to one image.              |
+| ~user.yeti.metadata.image.server~      | The server URL the spec specified (if any).                                             |
+| ~user.yeti.metadata.image.protocol~    | The protocol the spec specified (if any).                                               |
+
+The aliases list is the probably most interesting one. The spec's own alias is always included (so OCI images, where the local image record has no aliases of its own, still match), but it is united it with whatever the local image record carries (so multiple aliases pointing at the same image all count as equivalent). Later during the reconciliation, a check for ~spec.alias in stored_aliases~ is executed, a match means OK, mismatch means a real change.
+
+** Adoption of manually created instances
+
+If an instance with no metadata is named the same as a spec resource, ~yeti~ fails with a message that lists the exact ~incus config set~ commands needed to adopt it. The keys mirror what ~_build_metadata~ would have written. The user runs those commands (or deletes the instance), and the next run succeeds.
+
+* The ~yeti~ script
+
+** Transport: ~iq()~
+
+All API calls go through ~iq(path, method, data)~, a thin wrapper around ~incus query --wait --force-local~ by default. The ~--wait~ flag handles incus's asynchronous operations transparently. ~iq~ returns the parsed metadata on success, ~None~ on 404, or raises ~IncusError~ on anything else.
+
+Transport options (~--socket~, ~--user~, ~--remote~) toggle module-level globals ~_socket~ and ~_remote~ that ~iq~ reads on each call. The NixOS module always uses the default (admin socket, ~--force-local~).
+
+** Image resolution: ~resolve_image~
+
+Builds the ~source~ dict that ~POST /1.0/instances~ expects:
+
+- Fingerprint paths always check the local cache first.
+- A fingerprint miss falls back to the remote (if ~server~ is set), except for OCI where remote-by-fingerprint isn't possible.
+- Alias paths split on whether a server is present: server means remote fetch, no server means local-only.
+- When both fingerprint and alias are in the spec, fingerprint wins; the alias is still is recorded in metadata for future spec equivalence.
+
+The protocol value is validated against ~_KNOWN_PROTOCOLS = {"simplestreams", "oci", "incus"}~ upfront. Unknown values fail with a pointer to the constant in the script and the OCI special case as a guide for how to handle potential future protocols.
+
+** Diff: ~diff_instance~ + ~_compare_metadata~
+
+~diff_instance~ checks the fields that should match - description, profiles, ephemeral, config (with ~_strip_volatile~ removing incus-managed and yeti-managed keys), devices (subset check; existing extras are tolerated), and identity.
+
+Identity is delegated to ~_compare_metadata~, which reads the ~user.incus.metadata.*~ keys from the existing instance and compares against the spec. If ~_META_NAME~ is absent the instance isn't ours and ~_unmanaged_instance_message~ generates an adoption message with concrete ~incus config set~ commands.
+
+The diff never modifies a running instance. Mismatches always result in ~ResourceError~ - the user decides whether to update the spec or delete the instance.
+
+** Metadata annotation: ~_annotate_instance~
+
+After a successful create, ~_annotate_instance~ fetches the new instance, reads the fingerprint that incus actually assigned (from ~volatile.base_image~), looks up the image record for its aliases, and PATCHes a metadata block onto the instance.
+
+The PATCH only sends the metadata keys; incus's recursive merge preserves everything else. The result is six ~user.yeti.metadata.*~ keys per managed instance.
+
+** Output: ~_print_status~
+
+Formats each resource result consistently. Status word, resource id (~project/name~) on the same line, problem bullets indented under failures. Failure lines go to stderr; success lines to stdout.
+
+* The NixOS module
+
+** Option types
+
+The schema is built from nested submodules:
+
+- ~imageType~: the image source sub-spec with all nullable string options.
+- ~deviceType~: a submodule with one declared option (~type~) plus ~freeformType = attrsOf str~ so users can add arbitrary device fields without us enumerating them.
+- ~resourceType~: the per-instance schema, accepting ~{ name, ... }~ in its submodule lambda so the inner attribute key is available as a default for the ~name~ option.
+
+The outer option ~yeti~ is then ~attrsOf (attrsOf resourceType)~ — the two nesting levels are project and instance.
+
+** Serialization: ~serializeResource~
+
+Three things happen during serialization:
+
+1. The module-only ~forceEphemeral~ is translated into the spec's ~ephemeral~ field and dropped.
+2. ~kind = "instance"~ and the ~project~ name are injected.
+3. ~dropNulls~ filters out unset optional fields so the YAML stays clean.
+
+The result of mapping ~serializeResource~ across both nesting levels gets fed straight to ~pkgs.formats.yaml.generate~.
+
+** The ephemeral trap
+
+~ephemeral~ is defined as a hidden option (~visible = false~) whose only purpose is to be settable so the assertion can catch it. Setting ~ephemeral = true~ fires an assertion that explains why it's a footgun (the reconciler would re-create the instance on every rebuild) and points at ~forceEphemeral~ as the supported escape hatch. ~forceEphemeral~ is the actual option; ~serializeResource~ translates it back into the spec's ~ephemeral~ field at the last moment.
+
+The pattern generalizes. Any field where the obvious name has a dangerous default behavior can be implemented as ~name~ (trap) + ~forceName~ (working option) + assertion.
+
+** Systemd wiring
+
+The unit ~incus-yeti.service~ is a ~Type=oneshot~ with ~RemainAfterExit=true~:
+
+- ~after~ / ~requires~ ~incus.service~ - the service won't run before incus is ready.
+- ~path = [ pkgs.incus ]~ — puts the ~incus~ binary in PATH for the script's subprocess calls.
+- ~restartTriggers = [ specFile ]~ — when the spec's nix store path changes, the unit is restarted (which re-runs the oneshot).
+- ~User = incus-yeti~ / ~Group = incus-yeti~, with ~extraGroups = [ "incus-admin" ]~ on the user - provides the privilege to talk to the incus admin socket.
+- Standard hardening: ~ProtectSystem=strict~, ~NoNewPrivileges~, ~PrivateTmp~, etc.
+
+The user creation depends on the ~incus-admin~ group, which is created by ~virtualisation.incus.enable~. An assertion at the module level requires that option, with a message explaining why.
+
+

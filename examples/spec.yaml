@@ -1,0 +1,52 @@
+# Yeti standalone example:
+resources:
+  # Remote image — incus will pull it on first creation.
+  - kind: instance
+    project: default
+    name: test-container
+    type: container
+    image:
+      alias: debian/12
+      server: https://images.linuxcontainers.org
+      protocol: simplestreams
+    profiles: [default]
+    description: ""
+    config:
+      limits.cpu: "2"
+    devices: {}
+
+  # Local fingerprint — fails - since image does not exist
+  - kind: instance
+    project: default
+    name: fingerprint test
+    type: container
+    image:
+      fingerprint: 9260d88eda062b5a3be901dfc7595f0e05a9851bc0ad83c50b874e979aab00f6
+    profiles: [default]
+
+  # Local fingerprint — must already exist in this project.
+  - kind: instance
+    project: default
+    name: web-1
+    type: container
+    image:
+      fingerprint: 65bf3d28ca7e521f6b353dc32a42ef0dd819330bb4d48d30532a9e2ec609a696
+    profiles: [default]
+
+  # VM example — will fail loudly if "test-container" was created as a container.
+  - kind: instance
+    project: default
+    name: test-container
+    type: virtual-machine
+    image:
+      alias: debian/12
+      server: https://images.linuxcontainers.org
+
+  # VM example — will create a VM
+  - kind: instance
+    project: default
+    name: test-vm
+    type: virtual-machine
+    image:
+      alias: debian/12
+      server: https://images.linuxcontainers.org
