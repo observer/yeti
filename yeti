@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""
+YETI - Effortlessly Templates (incus) Instances  
+
+A cool little helper, that ensures incus resources match a desired spec.
+
+Usage:
+  ./yeti spec.yaml                 # admin socket (default)
+  ./yeti --user spec.yaml          # user socket
+  ./yeti --socket PATH spec.yaml   # custom socket path
+  ./yeti --remote NAME spec.yaml   # configured incus remote
+
+Yeti can be utilized either as NixOS module, by defining the desired incus
+instances as part of the NixOS configuration or alternatively as stand-alone
+tool.
+
+The scope of yeti is only to provide a convenient way to define and create 
+instances, not to provide a way to define other incus resources, as this can 
+already be done uilizing incus preseed capability.
+
+Yeti standalone:
+When used as standalone helper, it is possible to freely choose between the use
+of the incus socket (users must be members of the `incus-admin` group, the less 
+privileged incus user socket (users must be members of the `incus` group) or
+alternatively a remote incus API endpoint.
+
+Yeti on NixOS:
+While yeti can be used to interact with remote `incus` installations, this is 
+not the intended scope, when used as NixOS module: the deployment of instances 
+via nix config assumes that incus is already setup on the NixOS machine and the
+incus socket will be used for communication to prevent accidental changes on 
+other remote incus installations.
+
+`yeti` Behavior:
+Instead of simply creating instances according to the spec, `yeti` compares the
+instance properties from the instances in the spec to the corresponding 
+properties on the incus server:
+
+| Instance on incus server              | Behavior        |
+|=======================================+=================|
+| missing                               | create instance |
+|---------------------------------------+-----------------|
+| present, match                        | noop            |
+|---------------------------------------+-----------------|
+| present, mismatch                     | fail with diff  |
+|---------------------------------------+-----------------|
+| incus resource missing                | fail            |
+| (e.g. project, profile, network, ...) |                 |
+
+Spec format (one or more resources):
+  resources:
+    - kind: instance
+      project: default          # optional, defaults to "default"
+      name: web-1
+      type: container           # or "virtual-machine"
+      image:                    # accepts fingerprint OR remote alias
+        alias: debian/12
+        server: https://images.linuxcontainers.org
+        protocol: simplestreams
+      profiles: [default]
+      config:
+        limits.cpu: "2"
+      devices: {}
+      description: "web server"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from typing import Any
+from urllib.parse import quote
+
+try:
+    import yaml  # optional, only needed for YAML specs
+except ImportError:
+    yaml = None
+    
+# incus transport -----------------------------------------------------------------------
+
+# Default: the admin socket on the local machine, forced local so we never
+# accidentally hit a configured default remote. main() may override these
+# from CLI flags. Exactly one of (_socket, _remote) is non-None.
+DEFAULT_ADMIN_SOCKET = "/var/lib/incus/unix.socket"
+DEFAULT_USER_SOCKET = "/var/lib/incus/unix.socket.user"
+
+_socket: str | None = DEFAULT_ADMIN_SOCKET
+_remote: str | None = None
+
+
+class IncusError(RuntimeError):
+    pass
+
+# The iq function is pretty much the heart of yeti. It is used to construct 
+# and execute the `incus query` commands to retrieve information about the  
+# incus server was well as to create all instances defined in the `spec.yaml`.
+def iq(path: str, method: str = "GET", data: dict | None = None) -> Any:
+    """Run `incus query` and return the parsed metadata, or None on 404."""
+    if _remote is not None:
+        # Remote mode: prefix the path, don't force local, don't override env.
+        cmd = ["incus", "query", "--wait", "--request", method, f"{_remote}:{path}"]
+        env = None
+    else:
+        cmd = ["incus", "query", "--force-local", "--wait", "--request", method, path]
+        env = {**os.environ, "INCUS_SOCKET": _socket}
+    if data is not None:
+        cmd += ["--data", json.dumps(data)]
+    res = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    if res.returncode != 0:
+        err = res.stderr.strip()
+        if "not found" in err.lower():
+            return None
+        raise IncusError(f"{method} {path}: {err}")
+    out = res.stdout.strip()
+    return json.loads(out) if out else None
+
+
+def with_project(path: str, project: str) -> str:
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}project={quote(project)}"
+
+# diffing -------------------------------------------------------------------------------
+
+# Fields incus sets/computes that must be ignored when comparing existing vs desired.
+_INSTANCE_IGNORE_TOP = {
+    "architecture", "created_at", "last_used_at", "location",
+    "status", "status_code", "stateful", "project",
+    "expanded_config", "expanded_devices", "backups", "snapshots",
+    "state",
+}
+
+# yeti metadata -------------------------------------------------------------------------
+
+# We store identifying information about each instance we create as
+# user.yeti.metadata.* config keys, so subsequent runs can verify
+# the instance still corresponds to the spec without relying on
+# image.os/image.release (which OCI images don't have) or on the
+# alias cache (which can be stale or drift upstream).
+_META_PREFIX = "user.yeti.metadata"
+_META_NAME = f"{_META_PREFIX}.name"
+_META_INSTANCE_TYPE = f"{_META_PREFIX}.instance.type"
+_META_IMAGE_FINGERPRINT = f"{_META_PREFIX}.image.fingerprint"
+_META_IMAGE_ALIASES = f"{_META_PREFIX}.image.aliases"
+_META_IMAGE_SERVER = f"{_META_PREFIX}.image.server"
+_META_IMAGE_PROTOCOL = f"{_META_PREFIX}.image.protocol"
+
+
+def _strip_volatile(cfg: dict) -> dict:
+    """
+    Drop config keys that shouldn't participate in user-config diffing:
+      - volatile.*       - incus-managed runtime state
+      - image.*          - captured from the image at creation time
+      - user.yeti.*      - managed by this script (see _META_PREFIX)
+    """
+    return {k: v for k, v in cfg.items()
+            if not k.startswith("volatile.")
+            and not k.startswith("image.")
+            and not k.startswith(f"{_META_PREFIX}.")}
+
+
+def _image_aliases(fingerprint: str, project: str) -> list[str]:
+    """
+    Local aliases for an image (by fingerprint) in the given project,
+    sorted for deterministic output.
+
+    Returns [] if the image isn't found, has no recorded aliases (typical
+    for OCI images pulled from registries like Docker Hub that don't carry
+    incus-style alias metadata), or the fingerprint is empty. Callers
+    should treat an empty list as "nothing extra to record" rather than
+    "no aliases at all" - see `_build_metadata` which merges in the spec's
+    own alias.
+    """
+    if not fingerprint:
+        return []
+    img = iq(with_project(f"/1.0/images/{fingerprint}", project))
+    if img is None:
+        return []
+    return sorted({a.get("name") for a in (img.get("aliases") or []) if a.get("name")})
+
+
+def _instance_type(spec: dict) -> str:
+    """
+    Canonical type string for metadata.
+
+    The spec exposes `type: container | virtual-machine`, but OCI containers
+    deserve their own label since they have very different `image.*` config
+    keys and behaviour. OCI applies *only* to containers - incus would
+    reject `type: virtual-machine` with an OCI source anyway, since OCI
+    registries don't serve VM disk images. Guarding on `spec_type` keeps
+    this function honest even if someone constructs that combination.    
+    """
+    img = spec.get("image") or {}
+    spec_type = spec.get("type", "container")
+    if spec_type == "container" and img.get("protocol") == "oci":
+        return "oci"
+    return spec_type
+    
+
+def _build_metadata(spec: dict, fingerprint: str, image_aliases: list[str]) -> dict[str, str]:
+    """
+    Construct the user.yeti.metadata.* config keys for a new instance.
+
+    `image_aliases` is what the local image record reports - typically the
+    full alias list for simplestreams images, but often empty for OCI
+    images (Docker Hub, GHCR, etc.) since those registries don't expose
+    the same multi-alias notion. To make sure subsequent runs can still
+    match the spec, the alias the user specified in the spec (if any) is
+    always merged into the stored list.
+    """
+    img = spec.get("image") or {}
+    stored_aliases = set(image_aliases or [])
+    if "alias" in img:
+        stored_aliases.add(img["alias"])
+
+    meta = {
+        _META_NAME: spec["name"],
+        _META_INSTANCE_TYPE: _instance_type(spec),
+        _META_IMAGE_FINGERPRINT: fingerprint,
+        _META_IMAGE_ALIASES: json.dumps(sorted(stored_aliases)),
+    }
+    if "server" in img:
+        meta[_META_IMAGE_SERVER] = img["server"]
+        # protocol defaults to simplestreams server-side; record it explicitly
+        meta[_META_IMAGE_PROTOCOL] = img.get("protocol", "simplestreams")
+    return meta
+
+
+def _compare_metadata(spec: dict, cfg: dict, project: str) -> list[str]:
+    """
+    Compare the spec against the user.yeti.metadata.* fields stored on an
+    existing managed instance. Returns a list of human-readable problems.
+    """
+    problems: list[str] = []
+    img = spec.get("image") or {}
+
+    stored_name = cfg.get(_META_NAME)
+    if stored_name and stored_name != spec["name"]:
+        problems.append(
+            f"name: spec wants {spec['name']!r}, but this instance was originally "
+            f"created as {stored_name!r}. Either update the spec or re-create the instance."
+        )
+
+    stored_type = cfg.get(_META_INSTANCE_TYPE)
+    spec_type = _instance_type(spec)
+    if stored_type and stored_type != spec_type:
+        problems.append(
+            f"type: spec wants {spec_type!r}, but this instance was created as "
+            f"{stored_type!r}. Either update the spec or re-create the instance."
+        )
+
+    stored_fp = cfg.get(_META_IMAGE_FINGERPRINT, "")
+    if "fingerprint" in img:
+        spec_fp = img["fingerprint"]
+        if stored_fp and not (stored_fp.startswith(spec_fp) or spec_fp.startswith(stored_fp)):
+            problems.append(
+                f"image fingerprint: spec wants {spec_fp!r}, but this instance was "
+                f"built from {stored_fp!r}. Either update the spec or re-create the instance."
+            )
+    elif "alias" in img:
+        try:
+            stored_aliases = json.loads(cfg.get(_META_IMAGE_ALIASES) or "[]")
+        except (ValueError, TypeError):
+            stored_aliases = []
+        if img["alias"] not in stored_aliases:
+            aliases_str = (", ".join(repr(a) for a in stored_aliases)
+                           if stored_aliases else "(none recorded)")
+            problems.append(
+                f"image alias: spec wants {img['alias']!r}, but this instance was "
+                f"created from an image with aliases {aliases_str}. Either update the "
+                f"spec to use one of those aliases, or re-create the instance."
+            )
+
+    if "server" in img:
+        stored_server = cfg.get(_META_IMAGE_SERVER)
+        if stored_server and stored_server != img["server"]:
+            problems.append(
+                f"image server: spec wants {img['server']!r}, but this instance was "
+                f"created from {stored_server!r}. Either update the spec or "
+                f"re-create the instance."
+            )
+
+    return problems
+
+
+def _unmanaged_instance_message(spec: dict, existing: dict, project: str) -> str:
+    """
+    Build a message telling the user that the existing instance has no
+    yeti metadata, with concrete commands to either adopt it or
+    suggest deletion + recreation.
+    """
+    cfg = existing.get("config") or {}
+    inferred_fp = cfg.get("volatile.base_image", "")
+    img = spec.get("image") or {}
+    name = spec["name"]
+
+    pairs = [
+        (_META_NAME, name),
+        (_META_INSTANCE_TYPE, _instance_type(spec)),
+        (_META_IMAGE_FINGERPRINT, inferred_fp),
+    ]
+    if "alias" in img:
+        pairs.append((_META_IMAGE_ALIASES, json.dumps([img["alias"]])))
+    else:
+        pairs.append((_META_IMAGE_ALIASES, "[]"))
+    if "server" in img:
+        pairs.append((_META_IMAGE_SERVER, img["server"]))
+        pairs.append((_META_IMAGE_PROTOCOL, img.get("protocol", "simplestreams")))
+
+    cmds = [
+        f"incus config set {name} '{k}={v}' --project {project}"
+        for k, v in pairs
+    ]
+    cmds_block = "\n      ".join(cmds)
+
+    return (
+        "instance is not managed by yeti (no user.yeti.metadata.* keys found). "
+        "To bring it under management, either:\n"
+        "  (a) set the metadata manually:\n"
+        f"      {cmds_block}\n"
+        "  (b) delete the instance and let yeti re-create it on the next run."
+    )
+
+
+def diff_instance(existing: dict, desired: dict, project: str) -> list[str]:
+    """Return a list of human-readable mismatches; empty list = match."""
+    problems: list[str] = []
+
+    # Note: container-vs-virtual-machine and the container/oci sub-distinction
+    # are both handled by the metadata check below (_compare_metadata reads
+    # _META_INSTANCE_TYPE). For unmanaged instances, the "not managed by
+    # yeti" message guides the user toward the fix, so no separate
+    # top-level type check is needed here.    
+
+    if "description" in desired and existing.get("description", "") != desired["description"]:
+        problems.append(f"description: existing={existing.get('description')!r} "
+                        f"desired={desired['description']!r}")
+
+    if "profiles" in desired and sorted(existing.get("profiles", [])) != sorted(desired["profiles"]):
+        problems.append(f"profiles: existing={existing.get('profiles')} desired={desired['profiles']}")
+
+    if "ephemeral" in desired and bool(existing.get("ephemeral")) != bool(desired["ephemeral"]):
+        problems.append(f"ephemeral: existing={existing.get('ephemeral')} desired={desired['ephemeral']}")
+
+    # config: compare user-set keys only (drop volatile.* and image.*)
+    if "config" in desired:
+        existing_cfg = _strip_volatile(existing.get("config") or {})
+        for k, v in (desired["config"] or {}).items():
+            if str(existing_cfg.get(k)) != str(v):
+                problems.append(f"config[{k}]: existing={existing_cfg.get(k)!r} desired={v!r}")
+
+    # devices: each desired device must exist with matching keys; extras are ignored
+    if "devices" in desired:
+        existing_dev = existing.get("devices") or {}
+        for name, spec in (desired["devices"] or {}).items():
+            cur = existing_dev.get(name)
+            if cur is None:
+                problems.append(f"device[{name}]: missing on existing instance")
+                continue
+            for k, v in spec.items():
+                if str(cur.get(k)) != str(v):
+                    problems.append(f"device[{name}].{k}: existing={cur.get(k)!r} desired={v!r}")
+
+    # Identity check: read the metadata fields we stamped on the instance
+    # at creation time. If they're absent, the instance wasn't created by
+    # yeti (or someone scrubbed the keys); we surface that as a
+    # separate, actionable failure rather than guessing at properties.
+    existing_cfg = existing.get("config") or {}
+    if _META_NAME not in existing_cfg:
+        problems.append(_unmanaged_instance_message(desired, existing, project))
+    else:
+        problems.extend(_compare_metadata(desired, existing_cfg, project))
+
+    return problems
+
+
+# image resolution ----------------------------------------------------------------------
+
+# Remote transports incus currently supports.
+#   simplestreams - linuxcontainers.org, Ubuntu cloud images, etc.
+#   oci           - Docker Hub, GHCR, Quay - pull by alias/tag only,
+#                   never by raw digest. Constrains the fingerprint path
+#                   in resolve_image() below.
+#   incus         - another incus server's native API
+# If incus introduces a new protocol, add it here, and check whether it
+# needs special handling alongside the OCI case in resolve_image().
+_KNOWN_PROTOCOLS = frozenset({"simplestreams", "oci", "incus"})
+
+
+def resolve_image(spec: dict, project: str) -> dict:
+    """
+    Build a `source` dict suitable for POST /1.0/instances.
+ 
+    Fingerprints are content-addressed, so the algorithm always checks the
+    local cache first when a fingerprint is in the spec. A local hit means
+    we have the right bits, no matter what server/protocol the spec
+    mentions - there's nothing to gain (and possibly time to lose) by
+    re-fetching. The remote fetch is the fallback for cache misses, and
+    that fallback is where OCI's "alias/tag only" limitation applies.
+ 
+    Fingerprint path (`fingerprint` in spec):
+      1. Look up the fingerprint in the local image cache.
+      2. Local hit → return `{type: image, fingerprint: <fp>}`,
+         regardless of server/protocol/alias presence.
+      3. Local miss + no `server`  → fail.
+      4. Local miss + `protocol == "oci"`  → fail (OCI registries can't
+         be queried by fingerprint remotely; pre-cache by alias first).
+      5. Local miss + simplestreams/incus protocol → remote fetch by fingerprint.
+ 
+    Alias path (`alias` in spec, no `fingerprint`):
+      6. With `server` → remote fetch by alias.
+      7. Without `server` → local alias lookup required.
+ 
+    When both `fingerprint` and `alias` are given, fingerprint takes
+    precedence - the fetch decision is made entirely on fingerprint
+    resolution. The alias is still recorded in metadata via
+    `_build_metadata` so future specs that drop the fingerprint can
+    still match by alias.    
+    """
+    has_fp = "fingerprint" in spec
+    has_alias = "alias" in spec
+    has_server = "server" in spec
+
+    if not (has_fp or has_alias):
+        raise IncusError(f"image spec needs fingerprint or alias: {spec}")
+
+    # Catch unknown protocols upfront. Even when `protocol` ends up unused
+    # (e.g. because the fingerprint hits local cache), a typo or future-incus
+    # protocol value should fail with a clear message rather than slip
+    # through silently.
+    if "protocol" in spec and spec["protocol"] not in _KNOWN_PROTOCOLS:
+        raise IncusError(
+            f"image protocol {spec['protocol']!r} is not recognized. "
+            f"Supported protocols are: {', '.join(sorted(_KNOWN_PROTOCOLS))}. "
+            "If incus has added a new protocol since this script was written, "
+            "add it to _KNOWN_PROTOCOLS and decide in resolve_image() whether "
+            "it needs special handling (see how the OCI case constrains "
+            "fingerprint pulls)."
+        )
+
+    if has_fp:
+        fp = spec["fingerprint"]
+        # Local cache hit → done. Same bits as any remote image with this
+        # fingerprint would have been.
+        img = iq(with_project(f"/1.0/images/{fp}", project))
+        if img is not None:
+            return {"type": "image", "fingerprint": fp}
+ 
+        # Local miss - validate we can fetch remotely.
+        if not has_server:
+            raise IncusError(
+                f"image fingerprint {fp} not found locally in project {project!r}, "
+                "and no `server` is specified to fetch from. Either specify a "
+                "server, or pre-cache the image."
+            )
+
+        protocol = spec.get("protocol", "simplestreams")
+        if protocol == "oci":
+            raise IncusError(
+                f"image fingerprint {fp} not found locally in project {project!r}, "
+                "and OCI registries can only be queried by alias/tag - not by "
+                "fingerprint - so it can't be fetched remotely either. Pre-cache "
+                "the image (pull by alias first), or switch the protocol away "
+                "from OCI."                    
+            )
+
+        # Remote fetch by fingerprint (simplestreams or similar).
+        source = {
+            "type": "image",
+            "server": spec["server"],
+            "protocol": protocol,
+            "fingerprint": fp,            
+        }
+        return source
+
+    # Alias-only paths (no fingerprint in spec).
+    if has_server:
+        source = {
+            "type": "image",
+            "server": spec["server"],
+            "protocol": spec.get("protocol", "simplestreams"),
+            "alias": spec["alias"],
+        }
+        return source
+
+    a = iq(with_project(f"/1.0/images/aliases/{quote(spec['alias'], safe='')}", project))
+    if a is None:
+        raise IncusError(
+            f"image alias {spec['alias']!r} not found locally in project {project!r}. "
+            "Either specify a `server` so incus can fetch it from a registry, "
+            "or pre-cache the image."
+        )
+    return {"type": "image", "alias": spec["alias"]}
+
+
+# dependency checks ---------------------------------------------------------------------
+
+def require_project(project: str) -> None:
+    if iq(f"/1.0/projects/{quote(project)}") is None:
+        raise IncusError(f"project {project!r} does not exist (out of scope to create)")
+
+
+def require_profiles(profiles: list[str], project: str) -> None:
+    for p in profiles:
+        if iq(with_project(f"/1.0/profiles/{quote(p)}", project)) is None:
+            raise IncusError(f"profile {p!r} does not exist in project {project!r}")
+
+
+def require_devices(devices: dict, project: str) -> None:
+    """Sanity-check referenced networks and storage pools exist."""
+    for name, dev in (devices or {}).items():
+        t = dev.get("type")
+        if t == "nic" and "network" in dev:
+            if iq(with_project(f"/1.0/networks/{quote(dev['network'])}", project)) is None:
+                raise IncusError(f"device {name!r}: network {dev['network']!r} not found")
+        if t == "disk" and "pool" in dev:
+            if iq(with_project(f"/1.0/storage-pools/{quote(dev['pool'])}", project)) is None:
+                raise IncusError(f"device {name!r}: storage pool {dev['pool']!r} not found")
+
+
+# instance reconcile --------------------------------------------------------------------
+
+class ResourceError(Exception):
+    """Per-resource failure carrying a list of human-readable problems."""
+    def __init__(self, problems: list[str]):
+        self.problems = problems
+        super().__init__("; ".join(problems))
+
+
+def _annotate_instance(name: str, spec: dict, project: str) -> None:
+    """
+    After an instance is created, fetch back the fingerprint that incus
+    assigned (volatile.base_image), look up the image's local aliases,
+    and PATCH the resulting metadata onto the instance config.
+
+    PATCH on /1.0/instances/<name> does a recursive merge on config, so
+    sending only the metadata keys is safe - other config keys are
+    preserved.
+    """
+    created = iq(with_project(f"/1.0/instances/{quote(name)}", project))
+    if created is None:
+        # Shouldn't happen - the POST just succeeded - but bail gracefully.
+        return
+
+    fingerprint = (created.get("config") or {}).get("volatile.base_image", "")
+    aliases = _image_aliases(fingerprint, project)
+    metadata = _build_metadata(spec, fingerprint, aliases)
+
+    iq(
+        with_project(f"/1.0/instances/{quote(name)}", project),
+        method="PATCH",
+        data={"config": metadata},
+    )
+
+
+def reconcile_instance(spec: dict) -> str:
+    """
+    Return one of: "ok" (matches), "created" (newly created).
+    Raise ResourceError with a list of problems on any failure.
+    The caller is responsible for printing the resource identifier;
+    this function does not include it in the problem strings.
+    """
+    project = spec.get("project", "default")
+    name = spec["name"]
+
+    try:
+        require_project(project)
+        existing = iq(with_project(f"/1.0/instances/{quote(name)}", project))
+
+        if existing is None:
+            # Validate deps before creating.
+            if spec.get("profiles"):
+                require_profiles(spec["profiles"], project)
+            require_devices(spec.get("devices") or {}, project)
+            source = resolve_image(spec.get("image") or {}, project)
+
+            payload = {
+                "name": name,
+                "type": spec.get("type", "container"),
+                "source": source,
+                # `start: true` is how the incus API does create-and-start
+                # in one operation (the same effect as `incus launch`).
+                # Spec default mirrors the user-facing expectation that
+                # newly-created instances are usable immediately. Note: this
+                # only affects the create step; subsequent reconciles do not
+                # stop or start existing instances, so a manual `incus stop`
+                # won't be undone on the next rebuild.
+                "start": spec.get("autostart", True),
+            }
+            for k in ("description", "profiles", "config", "devices", "ephemeral"):
+                if k in spec:
+                    payload[k] = spec[k]
+
+            iq(with_project("/1.0/instances", project), method="POST", data=payload)
+
+            # Stamp the instance with yeti metadata so subsequent runs can
+            # identify it as managed and compare against the spec by fields
+            # we control, rather than image.* keys that don't exist on OCI
+            # images and drift on upstream rebuilds for distro images.
+            _annotate_instance(name, spec, project)
+            return "created"
+
+        problems = diff_instance(existing, spec, project)
+        if problems:
+            raise ResourceError(problems)
+        return "ok"
+
+    except IncusError as e:
+        # Surface low-level incus/API errors as resource-level problems
+        # so they get the same formatting and resource-id prefix as any
+        # other failure.
+        raise ResourceError([str(e)]) from e
+
+
+# dispatch ------------------------------------------------------------------------------
+
+HANDLERS = {
+    "instance": reconcile_instance,
+}
+
+
+def load_spec(path: str) -> dict:
+    with open(path) as f:
+        text = f.read()
+    if path.endswith((".yaml", ".yml")):
+        if yaml is None:
+            raise SystemExit("PyYAML not installed; use a .json spec or `pip install pyyaml`")
+        return yaml.safe_load(text)
+    return json.loads(text)
+
+
+def _print_status(status: str, res_id: str, problems: list[str] | None = None) -> None:
+    """
+    Print one resource's result. Format:
+
+        ok      default/web-1
+        created default/web-1
+        FAIL    default/web-1
+                - problem one
+                - problem two
+
+    Status column is left-padded to 7 chars (the width of "created"); problem
+    bullets indent to align under the resource id column, so each problem is
+    unambiguously attached to the FAIL line directly above it.
+    """
+    err = problems is not None
+    stream = sys.stderr if err else sys.stdout
+    print(f"{status:<7} {res_id}", file=stream)
+    for p in problems or []:
+        for i, line in enumerate(p.splitlines() or [""]):
+            prefix = "        - " if i == 0 else "          "
+            print(f"{prefix}{line}", file=stream)
+
+
+def main(argv: list[str]) -> int:
+    global _socket, _remote
+
+    parser = argparse.ArgumentParser(
+        prog="incus_reconcile",
+        description="Ensure incus resources match a desired spec.",
+    )
+    parser.add_argument("spec", help="path to a .yaml/.yml/.json spec file")
+
+    transport = parser.add_mutually_exclusive_group()
+    transport.add_argument(
+        "--user", action="store_true",
+        help=f"use the user socket ({DEFAULT_USER_SOCKET})",
+    )
+    transport.add_argument(
+        "--socket", metavar="PATH",
+        help=f"custom INCUS_SOCKET path (default: {DEFAULT_ADMIN_SOCKET})",
+    )
+    transport.add_argument(
+        "--remote", metavar="NAME",
+        help="use a configured incus remote instead of a local socket "
+             "(drops --force-local)",
+    )
+
+    args = parser.parse_args(argv[1:])
+
+    if args.remote:
+        _socket = None
+        _remote = args.remote
+    elif args.user:
+        _socket = DEFAULT_USER_SOCKET
+    elif args.socket:
+        _socket = args.socket
+    # else: keep the admin-socket default
+
+    doc = load_spec(args.spec)
+    resources = doc.get("resources") or []
+
+    rc = 0
+    for r in resources:
+        # Always identify the resource by project/name, regardless of how
+        # things go wrong further down.
+        project = r.get("project", "default")
+        name = r.get("name", "<unnamed>")
+        res_id = f"{project}/{name}"
+
+        kind = r.get("kind")
+        handler = HANDLERS.get(kind)
+        if handler is None:
+            _print_status("FAIL", res_id, [f"unsupported kind={kind!r}"])
+            rc = 1
+            continue
+
+        try:
+            status = handler(r)
+            _print_status(status, res_id)
+        except ResourceError as e:
+            _print_status("FAIL", res_id, e.problems)
+            rc = 1
+
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
